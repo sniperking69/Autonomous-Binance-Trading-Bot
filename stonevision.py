@@ -28,8 +28,17 @@ if torch.cuda.is_available():
 
 # Fixed grid size
 GRID_SIZE = 28  # 28x28 grid = 784 slots
+Chunk_size = 12  # Number of time steps in each chunk
+Batch_size = 6  # Batch size for training
+Num_grand_epochs = 1  # Number of grand epochs for training
+Period_size = 1500
 
-def marketDaysImage():
+Num_layers = 4
+Num_hidden = 128
+In_channel = 3   # z_open + z_close + pct_change input
+Out_channel = 1  # predict z_close
+
+def marketDataImage(periods=Period_size, grid_size=GRID_SIZE):
     client = Client(api_key, api_secret)
     exInfo = client.futures_exchange_info()
     tokens = sorted([
@@ -37,49 +46,68 @@ def marketDaysImage():
         if symbol["contractType"] == "PERPETUAL" and "USDT" in symbol["symbol"]
         and symbol["status"] == "TRADING"
     ])
-    total_cells = GRID_SIZE * GRID_SIZE
+    total_cells = grid_size * grid_size
     token_data = {}
     all_dates = set()
 
     for symbol in tokens:
         try:
-            candles = client.futures_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=1500)
+            candles = client.futures_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=periods)
             df = pd.DataFrame(candles, columns=[
                 "open_time", "open", "high", "low", "close", "volume",
                 "close_time", "quote_asset_volume", "number_of_trades",
                 "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"])
+            # Check for empty DataFrame
+            if df.empty or "open_time" not in df.columns:
+                #print(f"Token {symbol} has no data, will fill with zeros.")
+                continue
             df["date"] = pd.to_datetime(df["open_time"].astype(int), unit='ms').dt.strftime('%Y-%m-%d %H:%M')
             df["open"] = df["open"].astype(float)
             df["close"] = df["close"].astype(float)
+            # Z-score (global, not rolling)
             df["z_open"] = (df["open"] - df["open"].mean()) / (df["open"].std() + 1e-6)
             df["z_close"] = (df["close"] - df["close"].mean()) / (df["close"].std() + 1e-6)
             df["z_open"] = df["z_open"].replace([np.inf, -np.inf], 0).fillna(0)
             df["z_close"] = df["z_close"].replace([np.inf, -np.inf], 0).fillna(0)
+            # Open-to-close percent change
+            df["pct_change"] = ((df["close"] - df["open"]) / df["open"].replace(0, np.nan)) * 100
+            df["pct_change"] = df["pct_change"].replace([np.inf, -np.inf], 0).fillna(0)
             df = df.set_index("date")
-            token_data[symbol] = df[["z_open", "z_close"]]
+            token_data[symbol] = df[["z_open", "z_close", "pct_change"]]
             all_dates.update(df.index)
             sleep(0.2)
         except Exception as e:
             print(f"Error fetching {symbol}: {e}")
             continue
 
-    all_dates = sorted(all_dates)
+    # Align all tokens to the same date index, fill missing with zeros
+    all_dates = sorted(list(all_dates))[-periods:]
     for symbol in token_data:
         token_data[symbol] = token_data[symbol].reindex(all_dates, fill_value=0)
+    for symbol in tokens:
+        if symbol not in token_data:
+            print(f"Filling {symbol} with zeros for all dates.")
+            token_data[symbol] = pd.DataFrame(0, index=all_dates, columns=["z_open", "z_close", "pct_change"])
 
-    period_matrices = {}
+    print("Last 2 complete candle timestamps:", all_dates[-2:])
+
+    matrices = []
     for date in all_dates:
-        z_open_values = [token_data[sym].loc[date, "z_open"] for sym in tokens]
-        z_close_values = [token_data[sym].loc[date, "z_close"] for sym in tokens]
-        if len(z_open_values) < total_cells:
-            z_open_values += [0] * (total_cells - len(z_open_values))
-            z_close_values += [0] * (total_cells - len(z_close_values))
-        matrix_open = np.array(z_open_values).reshape((GRID_SIZE, GRID_SIZE))
-        matrix_close = np.array(z_close_values).reshape((GRID_SIZE, GRID_SIZE))
-        matrix = np.stack([matrix_open, matrix_close], axis=0)
-        period_matrices[date] = matrix
-
-    return period_matrices, all_dates, tokens
+        z_open = [token_data[sym].loc[date, "z_open"] if date in token_data[sym].index else 0 for sym in tokens]
+        z_close = [token_data[sym].loc[date, "z_close"] if date in token_data[sym].index else 0 for sym in tokens]
+        pct_change = [token_data[sym].loc[date, "pct_change"] if date in token_data[sym].index else 0 for sym in tokens]
+        # Pad to grid size if needed
+        if len(z_open) < total_cells:
+            z_open += [0] * (total_cells - len(z_open))
+            z_close += [0] * (total_cells - len(z_close))
+            pct_change += [0] * (total_cells - len(pct_change))
+        matrix = np.stack([
+            np.array(z_open).reshape(grid_size, grid_size),
+            np.array(z_close).reshape(grid_size, grid_size),
+            np.array(pct_change).reshape(grid_size, grid_size)
+        ], axis=0)
+        matrices.append(matrix)
+    return np.array(matrices), tokens, token_data, all_dates
 
 class CausalLSTMCell(nn.Module):
     def __init__(self, in_channel, num_hidden, width, filter_size, stride, layer_norm):
@@ -144,10 +172,10 @@ class PredRNNpp(nn.Module):
             next_frames.append(x_gen)
         return torch.stack(next_frames, dim=1)
 
-def train_pred_rnn(period_matrices, all_dates, num_grand_epochs=10, chunk_size=100, batch_size=8, model_path='pred_rnn_model.pth'):
+def train_pred_rnn(period_matrices, all_dates, num_grand_epochs=Num_grand_epochs, chunk_size=Chunk_size, batch_size=Batch_size, model_path='pred_rnn_model.pth'):
     torch.cuda.empty_cache()
     matrices = np.array([period_matrices[date] for date in all_dates])
-    model = PredRNNpp(4, 128, in_channel=2, out_channel=1, width=GRID_SIZE).to(device)
+    model = PredRNNpp(Num_layers, Num_hidden, in_channel=In_channel, out_channel=Out_channel, width=GRID_SIZE).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
 
@@ -162,9 +190,9 @@ def train_pred_rnn(period_matrices, all_dates, num_grand_epochs=10, chunk_size=1
         print(f"\n🌐 Grand Epoch [{grand_epoch+1}/{num_grand_epochs}]")
         grand_total_loss = 0
         total_batches = 0
-        for start in range(0, len(matrices)-chunk_size+1, chunk_size):
-            end = start + chunk_size
-            sequences = [matrices[i:i+11] for i in range(start, end-10)]
+        for start in range(0, len(matrices)-Chunk_size+1, Chunk_size):
+            end = start + Chunk_size
+            sequences = [matrices[i:i+Chunk_size] for i in range(start, end-Chunk_size+1)]
             if not sequences:
                 continue
             sequences = torch.FloatTensor(np.array(sequences))
@@ -188,6 +216,13 @@ def train_pred_rnn(period_matrices, all_dates, num_grand_epochs=10, chunk_size=1
     return model
 
 if __name__ == "__main__":
-    matrices, dates, tokens = marketDaysImage()
-    model = train_pred_rnn(matrices, dates, num_grand_epochs=1, chunk_size=12, batch_size=6, model_path='pred_rnn_model.pth')
+    matrices, tokens, token_data, dates = marketDataImage(periods=Period_size, grid_size=GRID_SIZE)
+    model = train_pred_rnn(
+        {date: matrices[i] for i, date in enumerate(dates)},
+        dates,
+        num_grand_epochs=Num_grand_epochs,
+        chunk_size=Chunk_size,
+        batch_size=Batch_size,
+        model_path='pred_rnn_model.pth'
+    )
     print("🏁 Training complete and model saved.")

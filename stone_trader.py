@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import pandas as pd
 from binance.client import Client
 from binance.enums import *
 from binance.exceptions import BinanceAPIException
@@ -13,16 +12,16 @@ from stonevision import PredRNNpp, Num_layers, Num_hidden, In_channel, Out_chann
 
 # --- Config ---
 model_path = "pred_rnn_model.pth"
-max_positions = 8
-mode = 'S'  # 'S'=Simulation, 'R'=Real Trading
+max_positions = 6
+mode = 'R'  # 'S'=Simulation, 'R'=Real Trading
 TRADED_BUFFER_FILE = "traded_buffer.json"
-FRAMES_TO_AVERAGE = 4
-supra_delta = 8
-
+supra_delta = 6
+MIN_MOVE = 0.5  # minimum delta_pct to consider
+sentiment_window_size= 3
 # --- Device & API ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 client = Client(api_key, api_secret)
-
+lvrg= 3  # Leverage for futures trading
 # --- Helpers ---
 def load_traded_buffer():
     if os.path.exists(TRADED_BUFFER_FILE):
@@ -50,17 +49,6 @@ def get_futures_balance():
         if asset['asset'] == 'USDT':
             return float(asset['balance'])
     return 0.0
-
-def compute_volatility(token_data, tokens):
-    vol_dict = {}
-    for token in tokens:
-        try:
-            last_changes = token_data[token]["pct_change"].dropna().iloc[-FRAMES_TO_AVERAGE:]
-            volatility = np.std(last_changes)
-            vol_dict[token] = volatility
-        except:
-            vol_dict[token] = 0
-    return vol_dict
 
 def truncate(number, precision):
     return int(number * (10 ** precision)) / (10 ** precision)
@@ -94,7 +82,7 @@ def close_position(symbol, tinfo):
     except Exception as e:
         print(f"Failed to close {symbol}: {e}")
 
-def Lsafe(symbol, mrgType="ISOLATED", lvrg=2):
+def Lsafe(symbol, mrgType="ISOLATED"):
     try:
         client.futures_change_leverage(symbol=symbol, leverage=lvrg)
         client.futures_change_margin_type(symbol=symbol, marginType=mrgType)
@@ -119,12 +107,17 @@ if __name__ == "__main__":
         print(f"Warning: input sequence length mismatch — Expected {Chunk_size}, got {input_tensor.shape[1]}")
 
     model = PredRNNpp(Num_layers, Num_hidden, in_channel=In_channel, out_channel=Out_channel, width=GRID_SIZE).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     print("Model loaded.")
 
+    avg_loss = checkpoint.get("avg_loss", 0)
+    sqrt_loss = np.sqrt(avg_loss)
+    print(f"Adjustment using sqrt(avg_loss): ±{sqrt_loss:.4f}")
+
     # Close all positions
-    for _ in range(4):
+    for _ in range(3):
         open_positions = get_active_positions()
         if not open_positions:
             print("All positions confirmed closed.")
@@ -139,35 +132,66 @@ if __name__ == "__main__":
     allocation = balance * 0.6
 
     with torch.no_grad():
-        output_seq = model(input_tensor)
-        avg_pred_next = np.mean(output_seq.squeeze(0).cpu().numpy()[:FRAMES_TO_AVERAGE], axis=0)
+        output = model(input_tensor)
+        next_frame = output[:, -1]
+        pred_next = next_frame.squeeze(0).cpu().numpy()
 
-    avg_pred_flat = avg_pred_next.flatten()
-    volatility_map = compute_volatility(token_data, tokens)
+    current_pct_change_flat = matrices[-1, 0].flatten()
+    pred_flat = pred_next.flatten()
+    total_pos = 0
+    total_neg = 0
 
+    for i in range(sentiment_window_size):
+        tmp_flat = matrices[-(i + 1), 0].flatten()
+        total_pos += np.sum(tmp_flat > 0)
+        total_neg += np.sum(tmp_flat < 0)
+
+    total_sentiment = total_pos + total_neg
+    sentiment_ratio = (total_pos - total_neg) / total_sentiment if total_sentiment > 0 else 0
+    print(f"Sentiment Ratio: {sentiment_ratio:.2f} (total_pos: {total_pos}, total_neg: {total_neg})")
+
+    # --- Compute sentiment ratio ---
     ineligible_tokens = [t for t in traded_buffer if (now - traded_buffer[t]) <= timedelta(hours=supra_delta)]
     signals = []
+
     for i, token in enumerate(tokens):
         if token in ineligible_tokens:
             continue
-        avg_z = avg_pred_flat[i]
-        volatility = volatility_map.get(token, 0)
-        if abs(avg_z) < 0.5 or volatility < 0.05:
-            continue
-        score = abs(avg_z) * volatility
-        direction = "LONG" if avg_z > 0 else "SHORT"
-        signals.append((token, direction, avg_z, volatility, score))
 
-    signals_sorted = sorted(signals, key=lambda x: x[4], reverse=True)[:max_positions]
+        predicted_pct = pred_flat[i]
+        current_pct = current_pct_change_flat[i]
+
+        if abs(current_pct) < MIN_MOVE:
+            continue
+
+        # --- Adjust prediction based on sqrt(avg_loss) ---
+        if predicted_pct > 0:
+            delta_pct = predicted_pct - sqrt_loss
+        else:
+            delta_pct = predicted_pct + sqrt_loss
+
+        #delta_pct += sentiment_ratio
+
+        if delta_pct > 0 and current_pct > 0 and sentiment_ratio > 0:
+            direction = "LONG" 
+        elif delta_pct < 0 and current_pct < 0 and sentiment_ratio < 0:
+            direction = "SHORT"
+        else:
+            continue
+
+        superscore = abs(delta_pct)+ abs(current_pct)
+        signals.append((token, direction, delta_pct, abs(superscore)))
+
+    signals_sorted = sorted(signals, key=lambda x: x[3], reverse=True)[:max_positions]
 
     if not signals_sorted:
         print("No strong signals to open positions.")
         exit(0)
 
     allocation_per = allocation / len(signals_sorted)
-    for token, direction, zscore, vol, score in signals_sorted:
+    for token, direction, delta_pct, score in signals_sorted:
         try:
-            klines = client.futures_klines(symbol=token, interval=Client.KLINE_INTERVAL_1HOUR, limit=1)
+            klines = client.futures_klines(symbol=token, interval=Client.KLINE_INTERVAL_5MINUTE, limit=1)
             if not klines:
                 raise ValueError(f"No kline data for {token}")
             opprice = float(klines[-1][4])
@@ -178,7 +202,7 @@ if __name__ == "__main__":
                 qty = truncate(min_notional / opprice, precision)
             side = SIDE_BUY if direction == "LONG" else SIDE_SELL
             Lsafe(token)
-            print(f"[{direction}] {token}: Avg Z-Score={zscore:.2f}, Volatility={vol:.2f}, Score={score:.2f}")
+            print(f"[{direction}] {token}: ΔPct={delta_pct:.2f}, Score={score:.2f}")
             print(f"Placing {direction} for {token} Qty={qty} Notional={qty * opprice:.2f}")
             place_order(client, token, side, qty, precision, mode)
             traded_buffer[token] = datetime.now(timezone.utc)

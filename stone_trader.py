@@ -13,7 +13,7 @@ from stonevision import PredRNNpp, Num_layers, Num_hidden, In_channel, Out_chann
 # --- Config ---
 model_path = "pred_rnn_model.pth"
 max_positions = 6
-mode = 'R'  # 'S'=Simulation, 'R'=Real Trading
+mode = 'S'  # 'S'=Simulation, 'R'=Real Trading
 TRADED_BUFFER_FILE = "traded_buffer.json"
 supra_delta = 6
 MIN_MOVE = 0.5  # minimum delta_pct to consider
@@ -214,3 +214,4 @@ if __name__ == "__main__":
         if (now - traded_buffer[token]) > timedelta(hours=supra_delta):
             del traded_buffer[token]
     save_traded_buffer(traded_buffer)
+

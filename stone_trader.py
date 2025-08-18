@@ -17,11 +17,10 @@ mode = 'S'  # 'S'=Simulation, 'R'=Real Trading
 TRADED_BUFFER_FILE = "traded_buffer.json"
 supra_delta = 6
 MIN_MOVE = 0.5  # minimum delta_pct to consider
-sentiment_window_size= 3
 # --- Device & API ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 client = Client(api_key, api_secret)
-lvrg= 3  # Leverage for futures trading
+lvrg= 2  # Leverage for futures trading
 # --- Helpers ---
 def load_traded_buffer():
     if os.path.exists(TRADED_BUFFER_FILE):
@@ -129,7 +128,7 @@ if __name__ == "__main__":
         sleep(1)
 
     balance = get_futures_balance()
-    allocation = balance * 0.6
+    allocation = balance * 0.8
 
     with torch.no_grad():
         output = model(input_tensor)
@@ -138,19 +137,14 @@ if __name__ == "__main__":
 
     current_pct_change_flat = matrices[-1, 0].flatten()
     pred_flat = pred_next.flatten()
-    total_pos = 0
-    total_neg = 0
 
-    for i in range(sentiment_window_size):
-        tmp_flat = matrices[-(i + 1), 0].flatten()
-        total_pos += np.sum(tmp_flat > 0)
-        total_neg += np.sum(tmp_flat < 0)
-
-    total_sentiment = total_pos + total_neg
-    sentiment_ratio = (total_pos - total_neg) / total_sentiment if total_sentiment > 0 else 0
-    print(f"Sentiment Ratio: {sentiment_ratio:.2f} (total_pos: {total_pos}, total_neg: {total_neg})")
-
-    # --- Compute sentiment ratio ---
+# --- Compute sentiment ratio ---
+    num_positive = np.sum(current_pct_change_flat > 0)
+    num_negative = np.sum(current_pct_change_flat < 0)
+    total_sentiment = num_positive + num_negative
+    sentiment_ratio = (num_positive - num_negative) / total_sentiment if total_sentiment > 0 else 0 
+    print(f"Sentiment Ratio: {sentiment_ratio:.2f} (Positive: {num_positive}, Negative: {num_negative})")
+    
     ineligible_tokens = [t for t in traded_buffer if (now - traded_buffer[t]) <= timedelta(hours=supra_delta)]
     signals = []
 
@@ -161,20 +155,23 @@ if __name__ == "__main__":
         predicted_pct = pred_flat[i]
         current_pct = current_pct_change_flat[i]
 
-        if abs(current_pct) < MIN_MOVE:
-            continue
-
-        # --- Adjust prediction based on sqrt(avg_loss) ---
         if predicted_pct > 0:
             delta_pct = predicted_pct - sqrt_loss
         else:
             delta_pct = predicted_pct + sqrt_loss
 
-        #delta_pct += sentiment_ratio
+        # --- Apply sentiment dampening ---#
+        if delta_pct > 0: 
+            delta_pct *= (1 - max(0, -sentiment_ratio)) 
+        else: 
+            delta_pct *= (1 - max(0, sentiment_ratio))
 
-        if delta_pct > 0 and current_pct > 0 and sentiment_ratio > 0:
-            direction = "LONG" 
-        elif delta_pct < 0 and current_pct < 0 and sentiment_ratio < 0:
+        if abs(delta_pct) < MIN_MOVE:
+            continue
+        
+        if delta_pct > 0:
+            direction = "LONG"
+        elif delta_pct < 0:
             direction = "SHORT"
         else:
             continue
@@ -214,4 +211,3 @@ if __name__ == "__main__":
         if (now - traded_buffer[token]) > timedelta(hours=supra_delta):
             del traded_buffer[token]
     save_traded_buffer(traded_buffer)
-

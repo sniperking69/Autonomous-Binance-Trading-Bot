@@ -154,12 +154,6 @@ if __name__ == "__main__":
 
         predicted_pct = pred_flat[i]
         current_pct = current_pct_change_flat[i]
-
-        if predicted_pct > 0:
-            delta_pct = predicted_pct - sqrt_loss
-        else:
-            delta_pct = predicted_pct + sqrt_loss
-
         # --- Apply sentiment dampening ---#
         if delta_pct > 0: 
             delta_pct *= (1 - max(0, -sentiment_ratio)) 
@@ -211,4 +205,5 @@ if __name__ == "__main__":
         if (now - traded_buffer[token]) > timedelta(hours=supra_delta):
             del traded_buffer[token]
     save_traded_buffer(traded_buffer)
+
 

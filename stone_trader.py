@@ -169,9 +169,9 @@ if __name__ == "__main__":
         if abs(delta_pct) < MIN_MOVE:
             continue
         
-        if delta_pct > 0:
+        if delta_pct > 0 and current_pct > 0:
             direction = "LONG"
-        elif delta_pct < 0:
+        elif delta_pct < 0 and current_pct < 0:
             direction = "SHORT"
         else:
             continue
@@ -211,3 +211,4 @@ if __name__ == "__main__":
         if (now - traded_buffer[token]) > timedelta(hours=supra_delta):
             del traded_buffer[token]
     save_traded_buffer(traded_buffer)
+
